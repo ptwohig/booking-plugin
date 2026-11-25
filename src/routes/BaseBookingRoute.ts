@@ -58,6 +58,7 @@ import {
     type ZeroAccessWriter,
 } from "@rapidmx/restapi";
 import { generateCandidateSlots, normalizeSlug, subtractBusy } from "../util/BookingUtils.js";
+import { externalBusyWindows as fetchExternalBusyWindows } from "../util/ExternalBusyUtils.js";
 import {
     BOOKING_REMINDER_MINUTES,
     bookingEventContent,
@@ -67,7 +68,7 @@ import {
     withReminderAlarm,
     type BookingEventDetails,
 } from "../util/BookingEventUtils.js";
-import { Booking, BookingLocationOption, BookingLocationType, BookingMeetingType, BookingProfile, BookingStatus, BookingType } from "../models/types.js";
+import { Booking, BookingLocationOption, BookingLocationType, BookingMeetingType, BookingProfile, BookingStatus, BookingType, type ExternalBusySource } from "../models/types.js";
 import {
     type BookingContent,
     bookingContentOf,
@@ -720,6 +721,41 @@ export abstract class BaseBookingRoute<
         return [...uids];
     }
 
+    /** Reads one external busy feed: `externalBusyWindows()` from `util/ExternalBusyUtils.js`, or a double in a test. */
+    protected readExternalBusyWindows: typeof fetchExternalBusyWindows = fetchExternalBusyWindows;
+
+    /**
+     * The busy windows of `bookingType`'s external calendars inside `[windowStart, windowEnd]` (rapidmx/server#11),
+     * for `slots()` and for `requireAvailableSlot()`'s re-check - the same list either one feeds to `subtractBusy()`.
+     * A feed that can't be read contributes nothing and is logged (never thrown: a booking page stays usable when
+     * somebody else's calendar server is down, and `externalBusyWindows()`'s cache keeps blocking the windows a
+     * recent fetch did report); a feed whose windows can't be *expanded* fail-closes inside `computeBusyWindows()`,
+     * the same way the host's own calendar does.
+     */
+    private async externalBusyWindows(bookingType: BT, windowStart: Date, windowEnd: Date): Promise<OccurrenceWindow[]> {
+        const sources: ExternalBusySource[] = bookingType.externalBusySources ?? [];
+        if (sources.length === 0) {
+            return [];
+        }
+        let outcomes: Record<string, { windows: OccurrenceWindow[]; error?: string; cachedMs?: number }>;
+        try {
+            outcomes = await this.readExternalBusyWindows(sources, windowStart, windowEnd);
+        } catch (err: any) {
+            // The whole call failing (not one feed) is a wiring surprise, not a down feed - logged, never thrown.
+            this.logger?.warn(`BookingRoute: could not check booking type ${bookingType.uid}'s external calendars: ${err?.message ?? err}`);
+            return [];
+        }
+        for (const source of sources) {
+            const outcome = outcomes[source.uid];
+            if (outcome?.error) {
+                this.logger?.warn(
+                    `BookingRoute: booking type ${bookingType.uid}'s external calendar '${source.label ?? source.url}' could not be read: ${outcome.error}`,
+                );
+            }
+        }
+        return sources.flatMap((source) => outcomes[source.uid]?.windows ?? []);
+    }
+
     /**
      * Counts the non-cancelled bookings already placed on the local calendar date containing `slotStart`.
      *
@@ -792,7 +828,10 @@ export abstract class BaseBookingRoute<
         const events: CE[] = (await this.findBusyEvents(await this.busyFolderUids(bookingType), paddedStart, paddedEnd)).filter(
             (event) => event.uid !== excludeEventUid,
         );
-        const busy: OccurrenceWindow[] = computeBusyWindows(events, paddedStart, paddedEnd);
+        const busy: OccurrenceWindow[] = [
+            ...computeBusyWindows(events, paddedStart, paddedEnd),
+            ...(await this.externalBusyWindows(bookingType, paddedStart, paddedEnd)),
+        ];
         if (subtractBusy([slot], busy, bookingType.bufferBeforeMinutes, bookingType.bufferAfterMinutes).length === 0) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "That time is no longer available.");
         }
@@ -1365,7 +1404,10 @@ export abstract class BaseBookingRoute<
         const busyFrom: Date = new Date(candidates[0].start.getTime() - bookingType.bufferBeforeMinutes * 60_000);
         const busyTo: Date = new Date(candidates[candidates.length - 1].end.getTime() + bookingType.bufferAfterMinutes * 60_000);
         const events: CE[] = await this.findBusyEvents(await this.busyFolderUids(bookingType), busyFrom, busyTo);
-        const busy: OccurrenceWindow[] = computeBusyWindows(events, busyFrom, busyTo);
+        const busy: OccurrenceWindow[] = [
+            ...computeBusyWindows(events, busyFrom, busyTo),
+            ...(await this.externalBusyWindows(bookingType, busyFrom, busyTo)),
+        ];
 
         // Capped: a visitor wanting later slots asks again with a later `from`.
         return subtractBusy(candidates, busy, bookingType.bufferBeforeMinutes, bookingType.bufferAfterMinutes).slice(0, MAX_SLOTS_PER_RESPONSE);

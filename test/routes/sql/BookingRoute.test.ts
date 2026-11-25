@@ -27,6 +27,7 @@ import { BookingLocationType, BookingStatus } from "../../../src/models/types.js
 import { VideoMeetingSQL, VideoMeetingInviteeSQL } from "@rapidmx/meet-plugin/sql";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 import { bookingSecuritySuite } from "../bookingSecuritySuite.js";
+import { bookingExternalBusySuite } from "../bookingExternalBusySuite.js";
 import { bookingMailboxSuite } from "../bookingMailboxSuite.js";
 import { bookingProtectionSuite } from "../bookingProtectionSuite.js";
 import { BookingKeyExpiryJobSQL } from "../../../src/jobs/sql/BookingKeyExpiryJobSQL.js";
@@ -1611,6 +1612,14 @@ describe("Route:BookingSQL Tests (anonymous)", () => {
         findBookings: async () => await bookingRepo.find(),
         rateLimiter: () => objectFactory.getInstance(RateLimiter),
         signedInToken: () => ownerToken,
+    });
+    bookingExternalBusySuite({
+        app: () => server.getApplication(),
+        baseUrl,
+        mailboxUid: () => mailbox.uid,
+        createBookingType,
+        findBookings: async () => await bookingRepo.find(),
+        route: () => objectFactory.getInstance("routes.BookingRoute"),
     });
     bookingMailboxSuite({
         app: () => server.getApplication(),
